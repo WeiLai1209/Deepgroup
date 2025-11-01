@@ -1,0 +1,304 @@
+#include <iostream>
+#include <vector>
+#include <set>
+#include <bitset>
+#include <map>
+#include <cmath>
+#include <algorithm>
+#include "../compress.h"
+#include "deepsketch.h"
+#include "../lz4.h"
+#include "../xxhash.h"
+extern "C" {
+    #include "../xdelta3/xdelta3.h"
+}
+#define INF 987654321
+using namespace std;
+
+typedef pair<int, int> ii;
+
+int main(int argc, char* argv[]) {
+    // 检查命令行参数数量是否正确
+    if (argc != 4) {
+        cerr << "usage: ./ann_inf [input_file] [script_module] [threshold]\n";
+        exit(0);
+    }
+
+    // 从命令行参数中获取阈值
+    int threshold = atoi(argv[3]);
+
+    // 通过文件IO读取数据
+    DATA_IO f(argv[1]);
+    f.read_file();
+
+    // 使用map存储XXH64哈希值和其对应的索引
+    map<XXH64_hash_t, int> dedup;
+
+    // 使用列表存储延迟去重的索引对
+    list<ii> dedup_lazy_recipe;
+
+    // 创建256维度的神经网络
+    NetworkHash network(256, argv[2]);
+
+    // 设置NGT索引文件路径
+    string indexPath = "ngtindex";
+
+    // 设置NGT索引的属性
+    NGT::Property property;
+    property.dimension = HASH_SIZE / 8;
+    property.objectType = NGT::ObjectSpace::ObjectType::Uint8;
+    property.distanceType = NGT::Index::Property::DistanceType::DistanceTypeHamming;
+
+    // 创建NGT索引
+    NGT::Index::create(indexPath, property);
+    NGT::Index index(indexPath);
+
+    // 创建ANN对象
+    ANN ann(20, 128, 16, threshold, &property, &index);
+
+    // 初始化总数变量
+    unsigned long long total = 0;
+
+    // 记录时间起点
+    f.time_check_start();
+
+    // 遍历数据集
+    for (int i = 0; i < f.N; ++i) {
+        // 计算数据的XXH64哈希值
+        XXH64_hash_t h = XXH64(f.trace[i], BLOCK_SIZE, 0);
+
+        // 如果哈希值已存在于dedup中，进行去重处理
+        if (dedup.count(h)) {
+            dedup_lazy_recipe.push_back({i, dedup[h]});
+            continue;
+        }
+// 将哈希值h关联到当前索引i，用于后续的去重处理
+dedup[h] = i;
+
+// 将数据推送到神经网络中，同时获取ANN请求的结果
+if (network.push(f.trace[i], i)) {
+    // 获取神经网络请求的哈希值和对应的索引
+    vector<pair<MYHASH, int>> myhash = network.request();
+
+    // 遍历神经网络请求的结果
+    for (int j = 0; j < myhash.size(); ++j) {
+        // 初始化一个RECIPE对象，用于存储处理后的数据
+        RECIPE r;
+
+        // 获取当前哈希值和对应的索引
+        MYHASH& h = myhash[j].first;
+        int index = myhash[j].second;
+
+        // 使用LZ4算法对数据进行自身压缩
+        int comp_self = LZ4_compress_default(f.trace[index], compressed, BLOCK_SIZE, 2 * BLOCK_SIZE);
+
+        // 初始化ANN请求的压缩距离和参考索引
+        int dcomp_ann = INF, dcomp_ann_ref;
+        dcomp_ann_ref = ann.request(h);
+
+        // 如果ANN请求的参考索引存在，则使用xdelta3算法进行压缩
+        if (dcomp_ann_ref != -1) {
+            dcomp_ann = xdelta3_compress(f.trace[index], BLOCK_SIZE, f.trace[dcomp_ann_ref], BLOCK_SIZE, delta_compressed, 1);
+        }
+
+        // 设置RECIPE的偏移量
+        set_offset(r, total);
+
+        // 判断使用自身压缩还是delta压缩，并设置RECIPE相应的字段
+        if (min(comp_self, BLOCK_SIZE) > dcomp_ann) { // delta compress
+            set_size(r, (unsigned long)(dcomp_ann - 1));
+            set_ref(r, dcomp_ann_ref);
+            set_flag(r, 0b11);
+            f.write_file(delta_compressed, dcomp_ann);
+            total += dcomp_ann;
+        }
+        else {
+            if (comp_self < BLOCK_SIZE) { // self compress
+                set_size(r, (unsigned long)(comp_self - 1));
+                set_flag(r, 0b01);
+                f.write_file(compressed, comp_self);
+                total += comp_self;
+            }
+            else { // no compress
+                set_flag(r, 0b00);
+                f.write_file(f.trace[index], BLOCK_SIZE);
+                total += BLOCK_SIZE;
+            }
+        }
+
+        // 打印哈希值和索引（仅在定义了PRINT_HASH的情况下）
+#ifdef PRINT_HASH
+        cout << index << ' ' << h << '\n';
+#endif
+
+// 将当前哈希值h和对应的索引index插入到ANN数据结构中
+ann.insert(h, index);
+
+// 处理延迟处理的RECIPE，直到其中的索引不再小于当前处理的索引index
+while (!dedup_lazy_recipe.empty() && dedup_lazy_recipe.begin()->first < index) {
+    // 从dedup_lazy_recipe中取出一项，创建相应的RECIPE，并插入到文件f中
+    RECIPE rr;
+    set_ref(rr, dedup_lazy_recipe.begin()->second);
+    set_flag(rr, 0b10);
+    f.recipe_insert(rr);
+    dedup_lazy_recipe.pop_front();
+}
+
+// 将当前处理的RECIPE插入到文件f中
+f.recipe_insert(r);
+}
+}
+}
+
+// 处理最后的网络请求
+{
+vector<pair<MYHASH, int>> myhash = network.request();
+for (int j = 0; j < myhash.size(); ++j) {
+    RECIPE r;
+
+    // 获取当前哈希值和对应的索引
+    MYHASH& h = myhash[j].first;
+    int index = myhash[j].second;
+
+    // 使用LZ4算法对数据进行自身压缩
+    int comp_self = LZ4_compress_default(f.trace[index], compressed, BLOCK_SIZE, 2 * BLOCK_SIZE);
+
+    // 初始化ANN请求的压缩距离和参考索引
+    int dcomp_ann = INF, dcomp_ann_ref;
+    dcomp_ann_ref = ann.request(h);
+
+    // 如果ANN请求的参考索引存在，则使用xdelta3算法进行压缩
+    if (dcomp_ann_ref != -1) {
+        dcomp_ann = xdelta3_compress(f.trace[index], BLOCK_SIZE, f.trace[dcomp_ann_ref], BLOCK_SIZE, delta_compressed, 1);
+    }
+
+    // 设置RECIPE的偏移量
+    set_offset(r, total);
+
+    // 判断使用自身压缩还是delta压缩，并设置RECIPE相应的字段
+    if (min(comp_self, BLOCK_SIZE) > dcomp_ann) { // delta compress
+        set_size(r, (unsigned long)(dcomp_ann - 1));
+        set_ref(r, dcomp_ann_ref);
+        set_flag(r, 0b11);
+        f.write_file(delta_compressed, dcomp_ann);
+        total += dcomp_ann;
+    }
+    else {
+        if (comp_self < BLOCK_SIZE) { // self compress
+            set_size(r, (unsigned long)(comp_self - 1));
+            set_flag(r, 0b01);
+            f.write_file(compressed, comp_self);
+            total += comp_self;
+        }
+        else { // no compress
+            set_flag(r, 0b00);
+            f.write_file(f.trace[index], BLOCK_SIZE);
+            total += BLOCK_SIZE;
+        }
+    }
+
+    // 打印哈希值和索引（仅在定义了PRINT_HASH的情况下）
+#ifdef PRINT_HASH
+    cout << index << ' ' << h << '\n';
+#endif
+
+// 向ANN（Approximate Nearest Neighbors）数据结构中插入哈希值h和对应的索引index
+ann.insert(h, index);
+
+// 处理延迟去重队列，将满足条件的RECIPE插入到f对象中
+while (!dedup_lazy_recipe.empty() && dedup_lazy_recipe.begin()->first < index) {
+    RECIPE rr;
+    // 从延迟去重队列中取出一条记录，并设置RECIPE的引用和标志位
+    set_ref(rr, dedup_lazy_recipe.begin()->second);
+    set_flag(rr, 0b10);
+    // 将RECIPE插入到f对象中
+    f.recipe_insert(rr);
+    // 弹出处理过的延迟去重队列记录
+    dedup_lazy_recipe.pop_front();
+}
+// 将当前处理的RECIPE插入到f对象中
+f.recipe_insert(r);
+}
+
+// 将所有RECIPE写入到文件中
+f.recipe_write();
+// 打印总体运行时间
+cout << "Total time: " << f.time_check_end() << "us\n";
+
+// 打印ANN数据结构相关信息
+printf("ANN %s with model %s\n", argv[1], argv[2]);
+// 打印最终处理的数据大小和占比
+printf("Final size: %llu (%.2lf%%)\n", total, (double)total * 100 / f.N / BLOCK_SIZE);
+}
+
+#endif
+
+// 继续向ANN数据结构中插入哈希值h和对应的索引index
+ann.insert(h, index);
+
+// 处理延迟去重队列，将满足条件的RECIPE插入到f对象中
+while (!dedup_lazy_recipe.empty() && dedup_lazy_recipe.begin()->first < index) {
+    RECIPE rr;
+    // 从延迟去重队列中取出一条记录，并设置RECIPE的引用和标志位
+    set_ref(rr, dedup_lazy_recipe.begin()->second);
+    set_flag(rr, 0b10);
+    // 将RECIPE插入到f对象中
+    f.recipe_insert(rr);
+    // 弹出处理过的延迟去重队列记录
+    dedup_lazy_recipe.pop_front();
+}
+// 将当前处理的RECIPE插入到f对象中
+f.recipe_insert(r);
+}
+
+// 处理最后一次请求
+{
+// 获取网络请求返回的哈希值和索引对
+vector<pair<MYHASH, int>> myhash = network.request();
+// 遍历处理每一个哈希值和索引对
+for (int j = 0; j < myhash.size(); ++j) {
+    RECIPE r;
+
+    // 取出当前哈希值和索引
+    MYHASH& h = myhash[j].first;
+    int index = myhash[j].second;
+
+    // 对当前数据块进行LZ4压缩
+    int comp_self = LZ4_compress_default(f.trace[index], compressed, BLOCK_SIZE, 2 * BLOCK_SIZE);
+    int dcomp_ann = INF, dcomp_ann_ref;
+    // 查询ANN数据结构，获取相似数据块的索引
+    dcomp_ann_ref = ann.request(h);
+
+    // 如果存在相似数据块，使用xdelta3算法进行压缩
+    if (dcomp_ann_ref != -1) {
+        dcomp_ann = xdelta3_compress(f.trace[index], BLOCK_SIZE, f.trace[dcomp_ann_ref], BLOCK_SIZE, delta_compressed, 1);
+    }
+
+    // 设置RECIPE的偏移量为当前总体数据大小
+    set_offset(r, total);
+
+    // 判断使用自身压缩还是使用相似数据块的差分压缩
+    if (min(comp_self, BLOCK_SIZE) > dcomp_ann) { // delta compress
+        set_size(r, (unsigned long)(dcomp_ann - 1));
+        set_ref(r, dcomp_ann_ref);
+        set_flag(r, 0b11);
+        // 将差分压缩后的数据块写入文件，并更新总体数据大小
+        f.write_file(delta_compressed, dcomp_ann);
+        total += dcomp_ann;
+    }
+    else {
+        if (comp_self < BLOCK_SIZE) { // self compress
+            set_size(r, (unsigned long)(comp_self - 1));
+            set_flag(r, 0b01);
+            // 将自身压缩后的数据块写入文件，并更新总体数据大小
+            f.write_file(compressed, comp_self);
+            total += comp_self;
+        }
+        else { // no compress
+            set_flag(r, 0b00);
+            // 将未压缩的数据块写入文件，并更新总体数据大小
+            f.write_file(f.trace[index], BLOCK_SIZE);
+            total += BLOCK_SIZE;
+        }
+    }
+}
